@@ -8,6 +8,8 @@ __pycache__/
 
 .hf-cache
 benchmark/hicache/LooGLE
+benchmark/hicache/ShareGPT_V3_unfiltered_cleaned_split.json
+benchmark/hicache/bench_all_results
 
 
 # Distribution / packaging

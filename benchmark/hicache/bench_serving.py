@@ -167,6 +167,11 @@ async def async_request_openai_completions(
                     output.prompt_len.append(actual_prompt_len)  # truncate <s>
                     output.output_len.append(actual_output_len)
                     output.generated_text.append(generated_text)
+                    if len(output.ttft) < len(output.generated_text):
+                        # A fully truncated request can complete without emitting
+                        # a token. Keep list lengths aligned so metrics can still
+                        # be reported for smoke tests with --allow-auto-truncate.
+                        output.ttft.append(latency)
                     output.success = True
                     output.latency.append(latency)
 
@@ -858,6 +863,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Output length for each request. Overrides the output length from the dataset.",
+    )
+    parser.add_argument(
+        "--max-prompt-len",
+        type=int,
+        default=None,
+        help="Drop dataset requests whose tokenized prompt exceeds this length.",
     )
     parser.add_argument(
         "--sharegpt-context-len",

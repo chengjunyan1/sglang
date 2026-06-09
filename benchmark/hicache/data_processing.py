@@ -98,6 +98,7 @@ def sample_sharegpt_requests(
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,
     fixed_output_len: Optional[int] = None,
+    max_prompt_len: Optional[int] = None,
 ) -> SampleOutput:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -142,7 +143,7 @@ def sample_sharegpt_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 4, 4, None, None, fixed_output_len
+        num_requests, new_dataset, tokenizer, 4, 4, max_prompt_len, None, fixed_output_len
     )
     return filtered_dataset
 
@@ -154,6 +155,7 @@ def sample_ultrachat_requests(
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,
     fixed_output_len: Optional[int] = None,
+    max_prompt_len: Optional[int] = None,
 ) -> SampleOutput:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -190,7 +192,7 @@ def sample_ultrachat_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 4, 4, None, None, fixed_output_len
+        num_requests, new_dataset, tokenizer, 4, 4, max_prompt_len, None, fixed_output_len
     )
     return filtered_dataset
 
@@ -203,6 +205,7 @@ def sample_loogle_requests(
     enable_multiturn: bool = True,
     enable_shared_prefix: bool = False,
     fixed_output_len: Optional[int] = None,
+    max_prompt_len: Optional[int] = None,
 ) -> SampleOutput:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -288,7 +291,7 @@ def sample_loogle_requests(
 
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 4, None, None, None, fixed_output_len
+        num_requests, new_dataset, tokenizer, 4, None, max_prompt_len, None, fixed_output_len
     )
     return filtered_dataset
 
@@ -557,6 +560,7 @@ def get_dataset(args, tokenizer):
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
             fixed_output_len=args.fixed_output_len,
+            max_prompt_len=args.max_prompt_len,
         )
     elif args.dataset_name == "ultrachat":
         input_requests = sample_ultrachat_requests(
@@ -566,6 +570,7 @@ def get_dataset(args, tokenizer):
             disable_shuffle=args.disable_shuffle,
             enable_multiturn=args.enable_multiturn,
             fixed_output_len=args.fixed_output_len,
+            max_prompt_len=args.max_prompt_len,
         )
     elif args.dataset_name == "loogle":
         input_requests = sample_loogle_requests(
@@ -576,6 +581,7 @@ def get_dataset(args, tokenizer):
             enable_multiturn=args.enable_multiturn,
             enable_shared_prefix=args.enable_shared_prefix,
             fixed_output_len=args.fixed_output_len,
+            max_prompt_len=args.max_prompt_len,
         )
     elif args.dataset_name == "nextqa":
         input_requests = sample_nextqa_requests(

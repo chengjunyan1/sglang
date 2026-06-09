@@ -1,5 +1,8 @@
 ## Run synthetic multi-turn benchmark
 
+For the all-in-one benchmark harness, fast mode, L3 storage-cache runs, fitness
+scoring, and profiling, see [`ALL_IN_ONE_README.md`](ALL_IN_ONE_README.md).
+
 ```
 # SGLang server with radix cache disabled
 python -m sglang.launch_server --model-path Qwen/Qwen2.5-14B-Instruct --port 30000 --disable-radix-cache
