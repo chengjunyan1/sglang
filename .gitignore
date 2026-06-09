@@ -7,6 +7,7 @@ __pycache__/
 *.so
 
 .hf-cache
+benchmark/hicache/LooGLE
 
 
 # Distribution / packaging
