@@ -8,6 +8,7 @@ __pycache__/
 
 .hf-cache
 
+
 # Distribution / packaging
 .Python
 **/build/
@@ -280,3 +281,5 @@ sgl-kernel/csrc/**/*_musa/
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+benchmark/hicache/LooGLE
+benchmark/hicache/LooGLE
