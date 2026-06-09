@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import pickle
@@ -5,7 +6,6 @@ import random
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
-from nextqa import NExTQALoader
 
 # from nextqa.video import , VideoPrompt
 from tqdm.asyncio import tqdm
@@ -220,38 +220,67 @@ def sample_loogle_requests(
     new_dataset = []
     # TODO: Add shared prefix support for loogle
     # NOTE: Now we preprocess it only for chat
-    for data in dataset:
-        chat = []
-        if (
-            "qa_pairs" not in data
-            or data["qa_pairs"] == "none"
-            or len(data["qa_pairs"]) == 0
-        ):
-            # If Q is none (for summarization),
-            # We add a question for summarization
-            # And keep the summary up to 1024 words
-            chat.append(
-                (
-                    "Input: "
-                    + data["input"]
-                    + " Question: "
-                    + "Please summarize the input",
-                    data["input"][:1024],
-                )
+    if dataset and "context" in dataset[0]:
+        grouped_dataset = {}
+        for data in dataset:
+            grouped_dataset.setdefault(data.get("doc_id", data.get("id")), []).append(
+                data
             )
-            new_dataset.append(chat)
-        else:
-            qa_pairs = eval(data["qa_pairs"])
-            for i, qa in enumerate(qa_pairs):
-                if i == 0 or enable_shared_prefix:
-                    # Combine input with the first Q
-                    chat.append(
-                        ("Input: " + data["input"] + " Question: " + qa["Q"], qa["A"])
-                    )
-                elif enable_multiturn:
-                    chat.append((qa["Q"], qa["A"]))
 
-            new_dataset.append(chat)
+        for rows in grouped_dataset.values():
+            chat = []
+            for i, data in enumerate(rows):
+                answer = data.get("answer", "")
+                if isinstance(answer, list):
+                    answer = ", ".join(str(item) for item in answer)
+                else:
+                    answer = str(answer)
+
+                question = data.get("question", "Please summarize the input")
+                if i == 0 or enable_shared_prefix:
+                    prompt = "Input: " + data["context"] + " Question: " + question
+                    chat.append((prompt, answer))
+                elif enable_multiturn:
+                    chat.append((question, answer))
+
+            if len(chat) != 0:
+                new_dataset.append(chat)
+    else:
+        for data in dataset:
+            chat = []
+            if (
+                "qa_pairs" not in data
+                or data["qa_pairs"] == "none"
+                or len(data["qa_pairs"]) == 0
+            ):
+                # If Q is none (for summarization),
+                # We add a question for summarization
+                # And keep the summary up to 1024 words
+                chat.append(
+                    (
+                        "Input: "
+                        + data["input"]
+                        + " Question: "
+                        + "Please summarize the input",
+                        data["input"][:1024],
+                    )
+                )
+                new_dataset.append(chat)
+            else:
+                qa_pairs = ast.literal_eval(data["qa_pairs"])
+                for i, qa in enumerate(qa_pairs):
+                    if i == 0 or enable_shared_prefix:
+                        # Combine input with the first Q
+                        chat.append(
+                            (
+                                "Input: " + data["input"] + " Question: " + qa["Q"],
+                                qa["A"],
+                            )
+                        )
+                    elif enable_multiturn:
+                        chat.append((qa["Q"], qa["A"]))
+
+                new_dataset.append(chat)
 
     # Shuffle the dataset.
     if not disable_shuffle:
@@ -289,6 +318,8 @@ def sample_nextqa_requests(
 
     if fixed_output_len is None:
         fixed_output_len = 4096
+
+    from nextqa import NExTQALoader
 
     # TODO: Check for multiturn
     dataset = NExTQALoader(video_dir=dataset_path, max_frames=max_frames)
