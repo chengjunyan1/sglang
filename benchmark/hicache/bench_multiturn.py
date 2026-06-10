@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import os
 import queue
 import random
 import threading
@@ -68,6 +69,15 @@ def parse_args():
         type=float,
         default=1.0,
         help="Average number of requests per second",
+    )
+    parser.add_argument(
+        "--max-prompt-len",
+        type=int,
+        default=0,
+        help=(
+            "Skip dataset prompts longer than this many tokens. "
+            "0 disables filtering."
+        ),
     )
     parser.add_argument(
         "--host",
@@ -178,6 +188,24 @@ def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
             )  # Write as a single line in JSONL format
     except IOError as e:
         print(f"Error writing to JSONL file: {e}")
+
+
+def admin_headers():
+    token = os.environ.get("SGLANG_ADMIN_API_KEY", "")
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
+def flush_cache(url: str, timeout_s: float = 60.0) -> None:
+    response = requests.post(
+        url,
+        params={"timeout": timeout_s},
+        headers=admin_headers(),
+        timeout=timeout_s + 30.0,
+    )
+    if response.status_code != 200:
+        print(f"WARNING: flush_cache failed: {response.status_code} {response.text[:160]}")
 
 
 class ReadyQueue:
@@ -564,6 +592,9 @@ class WorkloadGenerator:
         response_thread.join()
         self.pbar.close()
 
+        if not self.performance_metrics["ttft"]:
+            raise RuntimeError("No successful requests completed.")
+
         duration = self.finished_time - self.start_time
         sorted_ttft = sorted(self.performance_metrics["ttft"])
         sorted_latency = sorted(self.performance_metrics["latency"])
@@ -749,7 +780,7 @@ if __name__ == "__main__":
 
     for rate in request_rates:
         args.request_rate = rate
-        requests.post(flush_cache_url)
+        flush_cache(flush_cache_url)
         time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)

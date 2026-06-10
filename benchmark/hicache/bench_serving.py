@@ -41,6 +41,13 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 global args
 
 
+def get_admin_headers() -> Dict[str, str]:
+    token = os.environ.get("SGLANG_ADMIN_API_KEY", "")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 @dataclass
 class RequestFuncInput:
     prompts: List[Tuple[MsgContent, int, int]]
@@ -391,6 +398,7 @@ async def benchmark(
     extra_request_body: Dict[str, Any],
     profile: bool,
     enable_shared_prefix: bool,
+    flush_cache_timeout: float,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -450,7 +458,17 @@ async def benchmark(
 
     # Flush cache
     if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+        response = requests.post(
+            base_url + "/flush_cache",
+            params={"timeout": max(flush_cache_timeout, 0.0)},
+            headers=get_admin_headers(),
+            timeout=max(flush_cache_timeout, 0.0) + 30,
+        )
+        if not response.ok:
+            print(
+                "WARNING: flush_cache failed: "
+                f"{response.status_code} {response.text[:160]}"
+            )
 
     time.sleep(1.0)
 
@@ -793,6 +811,7 @@ def run_benchmark(args_: argparse.Namespace):
             extra_request_body=extra_request_body,
             profile=args.profile,
             enable_shared_prefix=args.enable_shared_prefix,
+            flush_cache_timeout=args.flush_cache_timeout,
         )
     )
 
@@ -901,6 +920,15 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+    )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=float,
+        default=60.0,
+        help=(
+            "Seconds to let SGLang /flush_cache wait for the server to become "
+            "idle after the initial single-prompt test."
+        ),
     )
     parser.add_argument(
         "--max-concurrency",

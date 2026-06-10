@@ -20,6 +20,7 @@ length at the token-id level.
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 import warnings
@@ -138,18 +139,16 @@ async def async_request_sglang_generate(
 
                         data = json.loads(chunk)
 
-                        if "text" in data and data["text"]:
+                        current_output_len = data.get("meta_info", {}).get(
+                            "completion_tokens", last_output_len
+                        )
+                        if current_output_len > last_output_len:
                             timestamp = time.perf_counter()
-                            generated_text = data["text"]
-                            current_output_len = data["meta_info"]["completion_tokens"]
-
                             if ttft == 0.0:
                                 ttft = timestamp - st
                                 output.ttft = ttft
                             else:
                                 num_new_tokens = current_output_len - last_output_len
-                                if num_new_tokens == 0:
-                                    continue
                                 chunk_gap = timestamp - most_recent_timestamp
                                 adjust_itl = chunk_gap / num_new_tokens
                                 output.itl.extend([adjust_itl] * num_new_tokens)
@@ -158,8 +157,19 @@ async def async_request_sglang_generate(
                             last_output_len = current_output_len
                             output.output_len = current_output_len
 
+                        if "text" in data and data["text"]:
+                            generated_text = data["text"]
+
                     output.generated_text = generated_text
-                    output.success = True
+                    if output.output_len <= 0:
+                        output.error = (
+                            "Server returned HTTP 200 but no generated tokens. "
+                            "This usually means the request was rejected before "
+                            "prefill; check prompt length and server logs."
+                        )
+                        output.success = False
+                    else:
+                        output.success = True
                     output.latency = latency
                 else:
                     output.error = (
@@ -206,9 +216,30 @@ async def run_batch(
     return await asyncio.gather(*tasks)
 
 
+def admin_headers() -> Dict[str, str]:
+    token = args.admin_api_key or os.environ.get("SGLANG_ADMIN_API_KEY", "")
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
 def flush_cache(base_url: str) -> None:
-    response = requests.post(f"{base_url}/flush_cache", timeout=30)
+    timeout_s = max(float(args.flush_cache_timeout), 0.0)
+    request_timeout = timeout_s + 30.0
+    response = requests.post(
+        f"{base_url}/flush_cache",
+        params={"timeout": timeout_s},
+        headers=admin_headers(),
+        timeout=request_timeout,
+    )
     response.raise_for_status()
+
+
+def display_args(namespace: argparse.Namespace) -> argparse.Namespace:
+    values = vars(namespace).copy()
+    if values.get("admin_api_key"):
+        values["admin_api_key"] = "<set>"
+    return argparse.Namespace(**values)
 
 
 def gen_token_ids(
@@ -629,6 +660,22 @@ async def main() -> None:
         help="Optional JSONL file to append one result object per shared-prefix percentage.",
     )
     parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=os.environ.get("SGLANG_ADMIN_API_KEY", ""),
+        help="Admin API key for protected endpoints such as /flush_cache.",
+    )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=float,
+        default=60.0,
+        help=(
+            "Seconds that /flush_cache may wait for the server to become idle. "
+            "Use this when the previous request has returned to the client but "
+            "the scheduler is still draining state."
+        ),
+    )
+    parser.add_argument(
         "--extra-request-body",
         metavar='{"key1": "value1", "key2": "value2"}',
         type=str,
@@ -650,7 +697,7 @@ async def main() -> None:
     tokenizer = get_tokenizer(tokenizer_id)
     vocab_ids = list(tokenizer.get_vocab().values())
 
-    print(f"{args}\n")
+    print(f"{display_args(args)}\n")
     print(f"Loading tokenizer from {tokenizer_id} ...")
     print(f"Tokenizer loaded (vocab_size={len(vocab_ids)})")
 

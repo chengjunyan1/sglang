@@ -2,13 +2,15 @@
 """
 Run a HiCache benchmark suite against an already-running SGLang server.
 
-The main selector is workload type, not dataset. Each workload chooses a
-reasonable default dataset or synthetic generator:
+The default suite follows the Strata dataset split:
 
 * strata-longdoc-loogle: LooGLE long-document QA workload.
 * strata-longdoc-narrativeqa: NarrativeQA long-document workload, if converted.
 * strata-multiround-sharegpt: ShareGPT-derived multi-round workload.
 * strata-multiround-reviewmt: ReviewMT multi-round workload, if converted.
+
+Additional cache-stress workloads are available explicitly:
+
 * serving-multiturn: LooGLE long dependency QA via OpenAI-compatible serving.
 * serving-shared-prefix: LooGLE shared-prefix serving pattern.
 * synthetic-multiturn: generated multi-round token workload.
@@ -21,6 +23,7 @@ memory/cache output, launch the server with --enable-metrics and
 """
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import math
@@ -34,28 +37,32 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, TextIO, Tuple
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+try:
+    from bench_all_report import build_session_summary, write_report
+except ImportError:  # pragma: no cover - used when run as a package module.
+    from .bench_all_report import build_session_summary, write_report
 
 
 DEFAULT_WORKLOADS = (
     "strata-longdoc-loogle",
-    "strata-multiround-sharegpt",
-    "warm-cache",
-)
-
-FAST_WORKLOADS = (
-    "strata-longdoc-loogle",
-    "strata-multiround-sharegpt",
-    "warm-cache",
-    "serving-shared-prefix",
-)
-
-ALL_WORKLOADS = DEFAULT_WORKLOADS + (
     "strata-longdoc-narrativeqa",
+    "strata-multiround-sharegpt",
     "strata-multiround-reviewmt",
+)
+
+EXTRA_CACHE_WORKLOADS = (
+    "warm-cache",
     "serving-shared-prefix",
+)
+
+ALL_WORKLOADS = DEFAULT_WORKLOADS + EXTRA_CACHE_WORKLOADS + (
+    "serving-multiturn",
+    "synthetic-multiturn",
+    "long-context",
 )
 
 DEFAULT_SERVING_REQUEST_RATES = "1,2,4,8,12,16,24"
@@ -73,30 +80,39 @@ DEFAULT_WARM_MAX_CONCURRENCY = 4
 DEFAULT_WARM_PCTS = "0,50,80,90,95,99"
 DEFAULT_LONG_CONTEXT_CLIENTS = 24
 DEFAULT_LONG_CONTEXT_REQUEST_RATE = 8.0
+DEFAULT_DATA_DIR = "data"
 
-FAST_SERVING_NUM_PROMPTS = 4
-FAST_SYNTHETIC_CLIENTS = 8
-FAST_SYNTHETIC_ROUNDS = 3
-FAST_SYNTHETIC_REQUEST_LENGTH = 512
-FAST_SYNTHETIC_OUTPUT_LENGTH = 8
-FAST_SYNTHETIC_MAX_PARALLEL = 2
-FAST_WARM_NUM_PROMPTS = 8
-FAST_WARM_TOTAL_TOKENS = 4096
-FAST_WARM_OUTPUT_LEN = 8
-FAST_WARM_MAX_CONCURRENCY = 2
-FAST_LONG_CONTEXT_CLIENTS = 4
+FAST_DATA_FRACTION = 0.05
+FAST_LONG_CONTEXT_FRACTION = 0.50
+FAST_DATASET_MULTITURN_FRACTION = 0.25
+FAST_MIN_SERVING_PROMPTS = 4
+FAST_MIN_WARM_PROMPTS = 4
+FAST_MIN_LONG_CONTEXT_CLIENTS = 8
+FAST_MIN_DATASET_MULTITURN_CLIENTS = 8
+FAST_REQUEST_RATES = "16"
 
-DEFAULT_DATASETS = {
-    "serving-multiturn": ("loogle", "LooGLE/data/longdep_qa.jsonl"),
-    "serving-shared-prefix": ("loogle", "LooGLE/data/longdep_qa.jsonl"),
-    "strata-longdoc-loogle": ("loogle", "LooGLE/data/longdep_qa.jsonl"),
-}
-
-LEGACY_WORKLOAD_ALIASES = {
-    "paper-longdoc-loogle": "strata-longdoc-loogle",
-    "paper-longdoc-narrativeqa": "strata-longdoc-narrativeqa",
-    "paper-multiround-sharegpt": "strata-multiround-sharegpt",
-    "paper-multiround-reviewmt": "strata-multiround-reviewmt",
+DATA_DIR_CANDIDATES = {
+    "loogle": (
+        "LooGLE/data/longdep_qa.jsonl",
+        "loogle/longdep_qa.jsonl",
+        "longdep_qa.jsonl",
+    ),
+    "sharegpt": (
+        "ShareGPT_V3_unfiltered_cleaned_split.json",
+        "sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json",
+        "sharegpt.json",
+    ),
+    "reviewmt": (
+        "reviewmt_sharegpt.json",
+        "ReviewMT/reviewmt_sharegpt.json",
+        "reviewmt/reviewmt_sharegpt.json",
+        "reviewmt_test_sharegpt.json",
+    ),
+    "narrativeqa": (
+        "narrativeqa_long_context.json",
+        "NarrativeQA/narrativeqa_long_context.json",
+        "narrativeqa/narrativeqa_long_context.json",
+    ),
 }
 
 DEFAULT_METRIC_PATTERNS = (
@@ -299,13 +315,44 @@ def parse_rates(value: str) -> List[float]:
         except ValueError:
             pass
         else:
-            rates = []
-            current = start
-            while current <= stop + 1e-9:
-                rates.append(round(current, 10))
-                current += step
-            return rates
+            if step > 0 and start + step <= stop + 1e-9:
+                rates = []
+                current = start
+                while current <= stop + 1e-9:
+                    rates.append(round(current, 10))
+                    current += step
+                return rates
     return [float(piece) for piece in pieces]
+
+
+def serving_rates(args: argparse.Namespace) -> List[float]:
+    if args.request_rates:
+        return parse_rates(args.request_rates)
+    if args.mode == "fast" and args.serving_request_rates == DEFAULT_SERVING_REQUEST_RATES:
+        return parse_rates(FAST_REQUEST_RATES)
+    return parse_rates(args.serving_request_rates)
+
+
+def synthetic_rates(args: argparse.Namespace) -> List[float]:
+    if args.request_rates:
+        return parse_rates(args.request_rates)
+    if (
+        args.mode == "fast"
+        and args.synthetic_request_rates == DEFAULT_SYNTHETIC_REQUEST_RATES
+    ):
+        return parse_rates(FAST_REQUEST_RATES)
+    return parse_rates(args.synthetic_request_rates)
+
+
+def long_context_rates(args: argparse.Namespace) -> List[float]:
+    if args.request_rates:
+        return parse_rates(args.request_rates)
+    if (
+        args.mode == "fast"
+        and args.long_context_request_rate == DEFAULT_LONG_CONTEXT_REQUEST_RATE
+    ):
+        return parse_rates(FAST_REQUEST_RATES)
+    return [float(args.long_context_request_rate)]
 
 
 def split_extra(value: Optional[str]) -> List[str]:
@@ -401,9 +448,59 @@ def write_text(path: Path, text: Optional[str]) -> None:
     path.write_text(text if text is not None else "", encoding="utf-8")
 
 
+def find_data_file(data_dir: str, dataset_key: str) -> str:
+    if not data_dir:
+        return ""
+    root = Path(data_dir).expanduser()
+    candidates = DATA_DIR_CANDIDATES.get(dataset_key, ())
+    for rel_path in candidates:
+        path = root / rel_path
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return str(path.resolve())
+        except OSError:
+            continue
+    return ""
+
+
 def append_jsonl(path: Path, obj: dict) -> None:
     with path.open("a", encoding="utf-8") as fout:
         fout.write(json.dumps(obj, sort_keys=True) + "\n")
+
+
+class TeeBuffer:
+    def __init__(self, primary, log_buffer):
+        self.primary = primary
+        self.log_buffer = log_buffer
+
+    def write(self, data: bytes) -> int:
+        self.primary.write(data)
+        self.log_buffer.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.log_buffer.flush()
+
+
+class TeeText:
+    def __init__(self, primary: TextIO, log_file: TextIO):
+        self.primary = primary
+        self.log_file = log_file
+        self.buffer = TeeBuffer(primary.buffer, log_file.buffer)
+        self.encoding = getattr(primary, "encoding", "utf-8")
+
+    def write(self, data: str) -> int:
+        self.primary.write(data)
+        self.log_file.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return self.primary.isatty()
 
 
 def read_jsonl(path: Optional[Path]) -> List[dict]:
@@ -649,192 +746,6 @@ def feedback_for_run(metrics: Dict[str, float]) -> List[str]:
     return feedback
 
 
-def aggregate_fitness(args: argparse.Namespace, records: List[dict]) -> float:
-    scores = [
-        float(record["fitness"])
-        for record in records
-        if isinstance(record.get("fitness"), (int, float))
-    ]
-    if not scores:
-        return args.fitness_fail_score
-    if args.fitness_aggregate == "min":
-        return min(scores)
-    if args.fitness_aggregate == "max":
-        return max(scores)
-    if args.fitness_aggregate == "sum":
-        return sum(scores)
-    return sum(scores) / len(scores)
-
-
-def collect_top_metrics(records: List[dict]) -> Dict[str, float]:
-    """Aggregate a compact set of feedback metrics across successful runs."""
-    totals: Dict[str, float] = {}
-    maxes: Dict[str, float] = {}
-    successful = [
-        record
-        for record in records
-        if record.get("returncode") == 0 and isinstance(record.get("feedback_metrics"), dict)
-    ]
-    for record in successful:
-        metrics = record["feedback_metrics"]
-        for key in [
-            "prompt_tokens",
-            "generation_tokens",
-            "requests",
-            "aborted_requests",
-            "cached_device_tokens",
-            "cached_host_tokens",
-            "cached_storage_file_tokens",
-            "cached_storage_mooncake_tokens",
-            "cached_storage_hf3fs_tokens",
-            "prefetched_tokens",
-            "backuped_tokens",
-            "evicted_tokens",
-            "load_back_tokens",
-        ]:
-            if key in metrics:
-                totals[key] = totals.get(key, 0.0) + float(metrics[key])
-        for key in [
-            "ttft_ms",
-            "e2e_ms",
-            "itl_ms",
-            "throughput_req_s",
-            "throughput_out_tok_s",
-            "cache_hit_rate",
-            "gpu_kv_used_tokens",
-            "host_kv_used_tokens",
-        ]:
-            if key in metrics:
-                maxes[key] = max(maxes.get(key, float("-inf")), float(metrics[key]))
-
-    merged = {f"sum.{key}": value for key, value in totals.items()}
-    merged.update({f"max.{key}": value for key, value in maxes.items()})
-    return merged
-
-
-def build_session_summary(
-    args: argparse.Namespace,
-    suite_dir: Path,
-    session_id: str,
-    records: List[dict],
-) -> dict:
-    succeeded = sum(1 for record in records if record.get("returncode") == 0)
-    failed = len(records) - succeeded
-    best = max(records, key=lambda item: item.get("fitness", float("-inf")), default=None)
-    summary = {
-        "schema_version": 1,
-        "session_id": session_id,
-        "candidate_id": args.candidate_id,
-        "candidate_notes": args.candidate_notes,
-        "mode": args.mode,
-        "workloads": args.workloads,
-        "data_fraction": args.data_fraction,
-        "sample_count": args.sample_count,
-        "l3_cache": args.l3_cache,
-        "l3_storage_backend": args.l3_storage_backend if args.l3_cache else "",
-        "l3_replay": args.l3_replay,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "suite_dir": str(suite_dir),
-        "fitness_higher_is_better": True,
-        "fitness_aggregate": args.fitness_aggregate,
-        "fitness_file": args.fitness_file,
-        "fitness_expr": args.fitness_expr or "",
-        "fitness_function": args.fitness_file
-        or args.fitness_expr
-        or "default_fitness(metrics)",
-        "fitness_score": aggregate_fitness(args, records),
-        "num_runs": len(records),
-        "succeeded": succeeded,
-        "failed": failed,
-        "best_run": {
-            "name": best.get("name"),
-            "workload": best.get("workload"),
-            "fitness": best.get("fitness"),
-        }
-        if best
-        else None,
-        "aggregate_feedback_metrics": collect_top_metrics(records),
-        "runs": [
-            {
-                "name": record.get("name"),
-                "workload": record.get("workload"),
-                "returncode": record.get("returncode"),
-                "elapsed_sec": record.get("elapsed_sec"),
-                "fitness": record.get("fitness"),
-                "feedback": record.get("feedback"),
-                "feedback_metrics": record.get("feedback_metrics"),
-                "benchmark_output": record.get("benchmark_output"),
-                "profile_dir": record.get("profile_dir"),
-                "stdout": record.get("stdout"),
-                "stderr": record.get("stderr"),
-            }
-            for record in records
-        ],
-    }
-    return summary
-
-
-def write_feedback_report(summary: dict, path: Path) -> None:
-    lines = [
-        "# HiCache Evolution Feedback",
-        "",
-        f"- session_id: `{summary['session_id']}`",
-        f"- candidate_id: `{summary.get('candidate_id') or ''}`",
-        f"- fitness_score: `{summary['fitness_score']:.6g}`",
-        f"- succeeded/failed: `{summary['succeeded']}/{summary['failed']}`",
-        f"- aggregate: `{summary['fitness_aggregate']}`",
-        "",
-        "## Best Run",
-        "",
-    ]
-    best = summary.get("best_run")
-    if best:
-        lines.extend(
-            [
-                f"- name: `{best['name']}`",
-                f"- workload: `{best['workload']}`",
-                f"- fitness: `{best['fitness']:.6g}`",
-                "",
-            ]
-        )
-    else:
-        lines.extend(["No run records.", ""])
-
-    lines.extend(["## Aggregate Metrics", ""])
-    for key, value in sorted(summary["aggregate_feedback_metrics"].items()):
-        lines.append(f"- `{key}`: `{value:.6g}`")
-
-    lines.extend(["", "## Run Feedback", ""])
-    for run in summary["runs"]:
-        lines.append(
-            f"### {run['name']}  fitness=`{float(run['fitness']):.6g}`"
-        )
-        for item in run.get("feedback") or []:
-            lines.append(f"- {item}")
-        metrics = run.get("feedback_metrics") or {}
-        compact_keys = [
-            "ttft_ms",
-            "e2e_ms",
-            "throughput_req_s",
-            "throughput_out_tok_s",
-            "cache_hit_rate",
-            "gpu_kv_used_tokens",
-            "host_kv_used_tokens",
-            "cached_device_tokens",
-            "cached_host_tokens",
-            "cached_storage_file_tokens",
-            "evicted_tokens",
-            "load_back_tokens",
-            "aborted_requests",
-        ]
-        for key in compact_keys:
-            if key in metrics:
-                lines.append(f"- `{key}`: `{float(metrics[key]):.6g}`")
-        lines.append("")
-
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
 def capture_server_snapshot(
     args: argparse.Namespace, run_dir: Path, label: str
 ) -> Dict[str, float]:
@@ -888,9 +799,6 @@ def clear_l3_storage(args: argparse.Namespace, reason: str) -> bool:
 
 
 def prepare_l3_cache(args: argparse.Namespace, suite_dir: Path) -> dict:
-    if not args.l3_cache:
-        return {}
-
     if args.l3_storage_backend == "file" and args.l3_storage_dir:
         Path(args.l3_storage_dir).mkdir(parents=True, exist_ok=True)
 
@@ -899,7 +807,6 @@ def prepare_l3_cache(args: argparse.Namespace, suite_dir: Path) -> dict:
         "runtime_attach": args.l3_runtime_attach,
         "clear_before_suite": args.clear_l3_cache,
         "clear_before_run": args.clear_l3_cache_before_run,
-        "replay": args.l3_replay,
         "file_storage_dir": args.l3_storage_dir,
         "payload": l3_storage_payload(args),
         "status_before": None,
@@ -1034,6 +941,8 @@ def run_child_process(args: argparse.Namespace, spec: RunSpec, run_dir: Path) ->
     stderr_path = run_dir / "stderr.log"
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if args.admin_api_key:
+        env["SGLANG_ADMIN_API_KEY"] = args.admin_api_key
 
     proc = subprocess.Popen(
         spec.cmd,
@@ -1109,22 +1018,15 @@ def preflight_server(args: argparse.Namespace) -> None:
         )
     if max_req_input_len is not None and max_req_input_len < 65536:
         print(
-            "[preflight] warning: LooGLE longdep prompts often exceed 32k tokens. "
-            "For this server, over-length prompts will be filtered by default."
+            "[preflight] warning: this server has a small max input length for "
+            "Strata-style long-context workloads. Strict mode will not filter "
+            "or truncate prompts; over-length workloads should fail instead of "
+            "being silently changed."
         )
-    if (
-        max_req_input_len is not None
-        and args.serving_max_prompt_len is None
-        and not args.no_auto_max_prompt_len
-    ):
-        args.serving_max_prompt_len = max_req_input_len
-        print(f"[preflight] using --max-prompt-len {max_req_input_len} for serving workloads")
-    if args.l3_cache and not info.get("hicache_storage_backend") and not args.l3_runtime_attach:
+    if max_req_input_len is not None and args.warm_total_tokens > max_req_input_len:
         print(
-            "[preflight] warning: --l3-cache requested, but server_info does not "
-            "show a storage backend. Start the server with "
-            "--hicache-storage-backend file, or pass --l3-runtime-attach with "
-            "--admin-api-key."
+            f"[preflight] warning: warm-cache total_tokens={args.warm_total_tokens} "
+            f"exceeds server max_req_input_len={max_req_input_len}."
         )
 
 
@@ -1186,16 +1088,16 @@ def run_command(args: argparse.Namespace, spec: RunSpec, suite_dir: Path) -> dic
     stderr_path = run_dir / "stderr.log"
     meta_path = suite_dir / "runs.jsonl"
 
-    if (
-        not args.dry_run
-        and args.l3_cache
-        and args.clear_l3_cache_before_run
-        and not spec.name.endswith("_l3_replay")
-    ):
+    if not args.dry_run and args.clear_l3_cache_before_run:
         clear_l3_storage(args, spec.name)
 
     if not args.dry_run and not args.no_flush_cache:
-        flushed = post(f"{base_url(args)}/flush_cache", headers=admin_headers(args))
+        flush_timeout = max(float(args.flush_cache_timeout), 0.0)
+        flushed = post(
+            f"{base_url(args)}/flush_cache?timeout={flush_timeout}",
+            timeout=flush_timeout + 30.0,
+            headers=admin_headers(args),
+        )
         print(f"[{spec.name}] flush_cache={'ok' if flushed else 'failed'}")
         time.sleep(args.post_flush_sleep)
 
@@ -1204,6 +1106,9 @@ def run_command(args: argparse.Namespace, spec: RunSpec, suite_dir: Path) -> dic
     )
 
     profile_dir = None if args.dry_run else start_profile(args, spec, run_dir)
+
+    if spec.output_path and spec.output_path.exists():
+        spec.output_path.unlink()
 
     print(f"[{spec.name}] {' '.join(shlex.quote(part) for part in spec.cmd)}")
     start = time.time()
@@ -1280,16 +1185,11 @@ def workload_dataset(
     args: argparse.Namespace,
     workload: str,
 ) -> tuple[str, str]:
-    default_name, default_path = DEFAULT_DATASETS.get(workload, ("", ""))
     if workload in {"serving-multiturn", "strata-longdoc-loogle"}:
-        return args.serving_multiturn_dataset_name, (
-            args.serving_multiturn_dataset_path or default_path
-        )
+        return "loogle", args.loogle_dataset_path
     if workload == "serving-shared-prefix":
-        return args.serving_shared_prefix_dataset_name, (
-            args.serving_shared_prefix_dataset_path or default_path
-        )
-    return default_name, default_path
+        return "loogle", args.loogle_dataset_path
+    return "", ""
 
 
 def build_serving_workload(
@@ -1300,7 +1200,13 @@ def build_serving_workload(
 ) -> List[RunSpec]:
     runs: List[RunSpec] = []
     dataset_name, dataset_path = workload_dataset(args, workload)
-    for rate in parse_rates(args.serving_request_rates):
+    if not dataset_path:
+        print(
+            f"[skip] {workload} requires LooGLE under --data-dir "
+            "(expected data/LooGLE/data/longdep_qa.jsonl)"
+        )
+        return []
+    for rate in serving_rates(args):
         name = f"{workload}_{dataset_name}_r{rate:g}"
         output_file = suite_dir / f"{safe_name(name)}.jsonl"
         cmd = [
@@ -1322,6 +1228,8 @@ def build_serving_workload(
             str(args.serving_num_prompts),
             "--output-file",
             str(output_file),
+            "--flush-cache-timeout",
+            str(args.flush_cache_timeout),
         ]
         if args.disable_child_progress:
             cmd.append("--disable-tqdm")
@@ -1351,7 +1259,10 @@ def build_synthetic_multiturn_runs(
     dataset_path: Optional[str] = None,
 ) -> List[RunSpec]:
     runs: List[RunSpec] = []
-    for rate in parse_rates(args.synthetic_request_rates):
+    num_clients = args.synthetic_clients
+    if dataset_path:
+        num_clients = dataset_multiround_client_count(args)
+    for rate in synthetic_rates(args):
         name = f"{workload.replace('-', '_')}_r{rate:g}"
         output_file = suite_dir / f"{safe_name(name)}.jsonl"
         cmd = [
@@ -1364,7 +1275,7 @@ def build_synthetic_multiturn_runs(
             "--model-path",
             args.model,
             "--num-clients",
-            str(args.synthetic_clients),
+            str(num_clients),
             "--num-rounds",
             str(args.synthetic_rounds),
             "--request-length",
@@ -1387,9 +1298,8 @@ def build_synthetic_multiturn_runs(
             cmd.append("--enable-round-barrier")
         if args.synthetic_disable_random_sample:
             cmd.append("--disable-random-sample")
-        selected_dataset_path = dataset_path or args.synthetic_dataset_path
-        if selected_dataset_path:
-            cmd.extend(["--dataset-path", selected_dataset_path])
+        if dataset_path:
+            cmd.extend(["--dataset-path", dataset_path])
         cmd.extend(split_extra(args.extra_synthetic_args))
         runs.append(
             RunSpec(name=name, workload=workload, cmd=cmd, output_path=output_file)
@@ -1419,6 +1329,8 @@ def build_warm_cache_runs(args: argparse.Namespace, suite_dir: Path) -> List[Run
         args.warm_pcts,
         "--output-file",
         str(output_file),
+        "--flush-cache-timeout",
+        str(args.flush_cache_timeout),
     ]
     if args.tokenizer:
         cmd.extend(["--tokenizer", args.tokenizer])
@@ -1427,53 +1339,74 @@ def build_warm_cache_runs(args: argparse.Namespace, suite_dir: Path) -> List[Run
 
 
 def build_long_context_runs(args: argparse.Namespace, suite_dir: Path) -> List[RunSpec]:
-    if not args.long_context_dataset_path:
-        print("[skip] long-context requires --long-context-dataset-path")
+    if not args.narrativeqa_dataset_path:
+        print(
+            "[skip] long-context requires NarrativeQA under --data-dir "
+            "(expected data/narrativeqa_long_context.json)"
+        )
         return []
 
-    name = "long_context"
-    output_file = suite_dir / f"{safe_name(name)}.jsonl"
-    cmd = [
-        sys.executable,
-        "bench_long_context.py",
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-        "--model-path",
-        args.model,
-        "--dataset-path",
-        args.long_context_dataset_path,
-        "--num-clients",
-        str(args.long_context_clients),
-        "--request-rate",
-        str(args.long_context_request_rate),
-        "--disable-auto-run",
-        "--log-file",
-        str(output_file),
-        "--tag",
-        args.tag or name,
-    ]
-    cmd.extend(split_extra(args.extra_long_context_args))
-    return [RunSpec(name=name, workload="long-context", cmd=cmd, output_path=output_file)]
+    rates = long_context_rates(args)
+    runs: List[RunSpec] = []
+    for rate in rates:
+        name = "long_context"
+        if len(rates) > 1 or args.request_rates:
+            name = f"{name}_r{rate:g}"
+        output_file = suite_dir / f"{safe_name(name)}.jsonl"
+        cmd = [
+            sys.executable,
+            "bench_long_context.py",
+            "--host",
+            args.host,
+            "--port",
+            str(args.port),
+            "--model-path",
+            args.model,
+            "--dataset-path",
+            args.narrativeqa_dataset_path,
+            "--num-clients",
+            str(args.long_context_clients),
+            "--request-rate",
+            str(rate),
+            "--disable-auto-run",
+            "--log-file",
+            str(output_file),
+            "--tag",
+            args.tag or name,
+        ]
+        if args.long_context_max_prompt_len is not None:
+            cmd.extend(["--max-prompt-len", str(args.long_context_max_prompt_len)])
+        cmd.extend(split_extra(args.extra_long_context_args))
+        runs.append(
+            RunSpec(name=name, workload="long-context", cmd=cmd, output_path=output_file)
+        )
+    return runs
 
 
 def build_strata_narrativeqa_runs(
     args: argparse.Namespace, suite_dir: Path
 ) -> List[RunSpec]:
-    if not args.strata_narrativeqa_dataset_path:
+    if not args.narrativeqa_dataset_path:
         print(
             "[skip] strata-longdoc-narrativeqa requires "
-            "--strata-narrativeqa-dataset-path in bench_long_context.py JSON format"
+            "NarrativeQA under --data-dir (expected data/narrativeqa_long_context.json)"
         )
         return []
 
-    old_path = args.long_context_dataset_path
-    args.long_context_dataset_path = args.strata_narrativeqa_dataset_path
     runs = build_long_context_runs(args, suite_dir)
-    args.long_context_dataset_path = old_path
     for run in runs:
-        run.name = run.name.replace("long_context", "strata_longdoc_narrativeqa")
+        old_name = run.name
+        new_name = run.name.replace("long_context", "strata_longdoc_narrativeqa")
+        if run.output_path:
+            old_output = str(run.output_path)
+            new_output = suite_dir / f"{safe_name(new_name)}.jsonl"
+            for idx, part in enumerate(run.cmd):
+                if part == old_output:
+                    run.cmd[idx] = str(new_output)
+                if idx > 0 and run.cmd[idx - 1] == "--tag" and part == old_name:
+                    run.cmd[idx] = new_name
+            run.output_path = new_output
+        run.name = new_name
         run.workload = "strata-longdoc-narrativeqa"
     return runs
 
@@ -1481,17 +1414,17 @@ def build_strata_narrativeqa_runs(
 def build_strata_reviewmt_runs(
     args: argparse.Namespace, suite_dir: Path
 ) -> List[RunSpec]:
-    if not args.strata_reviewmt_dataset_path:
+    if not args.reviewmt_dataset_path:
         print(
             "[skip] strata-multiround-reviewmt requires "
-            "--strata-reviewmt-dataset-path converted to ShareGPT-style JSON"
+            "ReviewMT under --data-dir (expected data/reviewmt_sharegpt.json)"
         )
         return []
     return build_synthetic_multiturn_runs(
         args,
         suite_dir,
         workload="strata-multiround-reviewmt",
-        dataset_path=args.strata_reviewmt_dataset_path,
+        dataset_path=args.reviewmt_dataset_path,
     )
 
 
@@ -1504,26 +1437,18 @@ def expand_workloads(value: str) -> List[str]:
 
     aliases = {
         "serving": ["serving-multiturn", "serving-shared-prefix"],
-        "fast": list(FAST_WORKLOADS),
+        "cache-extra": list(EXTRA_CACHE_WORKLOADS),
+        "cache": list(EXTRA_CACHE_WORKLOADS),
+        "extra": list(EXTRA_CACHE_WORKLOADS),
+        "shared-prefix": ["serving-shared-prefix"],
         "multiturn": ["synthetic-multiturn"],
         "synthetic": ["synthetic-multiturn"],
-        "strata": [
-            "strata-longdoc-loogle",
-            "strata-longdoc-narrativeqa",
-            "strata-multiround-reviewmt",
-            "strata-multiround-sharegpt",
-        ],
-        "paper": [
-            "strata-longdoc-loogle",
-            "strata-longdoc-narrativeqa",
-            "strata-multiround-reviewmt",
-            "strata-multiround-sharegpt",
-        ],
+        "strata": list(DEFAULT_WORKLOADS),
     }
     expanded: List[str] = []
     for item in selected:
         for expanded_item in aliases.get(item, [item]):
-            expanded.append(LEGACY_WORKLOAD_ALIASES.get(expanded_item, expanded_item))
+            expanded.append(expanded_item)
     return expanded
 
 
@@ -1539,12 +1464,18 @@ def build_runs(args: argparse.Namespace, suite_dir: Path) -> List[RunSpec]:
         elif workload == "synthetic-multiturn":
             runs.extend(build_synthetic_multiturn_runs(args, suite_dir))
         elif workload == "strata-multiround-sharegpt":
+            if not args.sharegpt_dataset_path:
+                print(
+                    "[skip] strata-multiround-sharegpt requires ShareGPT under "
+                    "--data-dir (expected data/ShareGPT_V3_unfiltered_cleaned_split.json)"
+                )
+                continue
             runs.extend(
                 build_synthetic_multiturn_runs(
                     args,
                     suite_dir,
                     workload="strata-multiround-sharegpt",
-                    dataset_path=args.strata_sharegpt_dataset_path,
+                    dataset_path=args.sharegpt_dataset_path,
                 )
             )
         elif workload == "strata-multiround-reviewmt":
@@ -1560,113 +1491,90 @@ def build_runs(args: argparse.Namespace, suite_dir: Path) -> List[RunSpec]:
     return runs
 
 
-def clone_run_with_name(run: RunSpec, new_name: str, suite_dir: Path) -> RunSpec:
-    new_output = suite_dir / f"{safe_name(new_name)}.jsonl" if run.output_path else None
-    new_cmd = list(run.cmd)
-    if run.output_path and new_output:
-        old_output = str(run.output_path)
-        for idx, part in enumerate(new_cmd):
-            if part == old_output:
-                new_cmd[idx] = str(new_output)
-    return RunSpec(
-        name=new_name,
-        workload=run.workload,
-        cmd=new_cmd,
-        output_path=new_output,
-    )
-
-
-def maybe_add_l3_replay_runs(
-    args: argparse.Namespace, runs: List[RunSpec], suite_dir: Path
-) -> List[RunSpec]:
-    if not args.l3_replay:
-        return runs
-
-    replayable = {
-        "strata-longdoc-loogle",
-        "serving-multiturn",
-        "serving-shared-prefix",
-        "warm-cache",
-    }
-    expanded: List[RunSpec] = []
-    for run in runs:
-        if run.workload not in replayable:
-            expanded.append(run)
-            continue
-        expanded.append(clone_run_with_name(run, f"{run.name}_l3_populate", suite_dir))
-        expanded.append(clone_run_with_name(run, f"{run.name}_l3_replay", suite_dir))
-    return expanded
-
-
-def scale_count(value: int, fraction: float, cap: Optional[int]) -> int:
+def scale_count(
+    value: int, fraction: float, cap: Optional[int], minimum: int = 1
+) -> int:
     scaled = value
     if fraction < 1.0:
-        scaled = max(1, math.ceil(scaled * fraction))
+        scaled = max(minimum, math.ceil(scaled * fraction))
     if cap is not None:
         scaled = min(scaled, cap)
     return max(1, scaled)
 
 
-def apply_presets(args: argparse.Namespace) -> None:
+def dataset_multiround_client_count(args: argparse.Namespace) -> int:
+    cap = args.sample_count if args.sample_count > 0 else None
+    fraction = getattr(args, "dataset_multiround_fraction", args.data_fraction)
+    minimum = getattr(args, "dataset_multiround_min_clients", 1)
+    if fraction < 1.0 or cap is not None:
+        return scale_count(args.synthetic_clients, fraction, cap, minimum)
+    return args.synthetic_clients
+
+
+def normalize_args(args: argparse.Namespace) -> None:
+    """Fill defaults, resolve dataset paths, and apply explicit sample scaling."""
     if args.fast:
         args.mode = "fast"
 
     if args.workloads is None:
-        args.workloads = "fast" if args.mode == "fast" else "strata"
+        args.workloads = "strata"
 
-    if args.mode == "fast":
-        if args.serving_request_rates == DEFAULT_SERVING_REQUEST_RATES:
-            args.serving_request_rates = "2"
-        if args.synthetic_request_rates == DEFAULT_SYNTHETIC_REQUEST_RATES:
-            args.synthetic_request_rates = "2"
-        if args.serving_num_prompts == DEFAULT_SERVING_NUM_PROMPTS:
-            args.serving_num_prompts = FAST_SERVING_NUM_PROMPTS
-        if args.synthetic_clients == DEFAULT_SYNTHETIC_CLIENTS:
-            args.synthetic_clients = FAST_SYNTHETIC_CLIENTS
-        if args.synthetic_rounds == DEFAULT_SYNTHETIC_ROUNDS:
-            args.synthetic_rounds = FAST_SYNTHETIC_ROUNDS
-        if args.synthetic_request_length == DEFAULT_SYNTHETIC_REQUEST_LENGTH:
-            args.synthetic_request_length = FAST_SYNTHETIC_REQUEST_LENGTH
-        if args.synthetic_output_length == DEFAULT_SYNTHETIC_OUTPUT_LENGTH:
-            args.synthetic_output_length = FAST_SYNTHETIC_OUTPUT_LENGTH
-        if args.synthetic_max_parallel == DEFAULT_SYNTHETIC_MAX_PARALLEL:
-            args.synthetic_max_parallel = FAST_SYNTHETIC_MAX_PARALLEL
-        if args.warm_num_prompts == DEFAULT_WARM_NUM_PROMPTS:
-            args.warm_num_prompts = FAST_WARM_NUM_PROMPTS
-        if args.warm_total_tokens == DEFAULT_WARM_TOTAL_TOKENS:
-            args.warm_total_tokens = FAST_WARM_TOTAL_TOKENS
-        if args.warm_output_len == DEFAULT_WARM_OUTPUT_LEN:
-            args.warm_output_len = FAST_WARM_OUTPUT_LEN
-        if args.warm_max_concurrency == DEFAULT_WARM_MAX_CONCURRENCY:
-            args.warm_max_concurrency = FAST_WARM_MAX_CONCURRENCY
-        if args.warm_pcts == DEFAULT_WARM_PCTS:
-            args.warm_pcts = "0,80"
-        if args.long_context_clients == DEFAULT_LONG_CONTEXT_CLIENTS:
-            args.long_context_clients = FAST_LONG_CONTEXT_CLIENTS
-        if args.long_context_request_rate == DEFAULT_LONG_CONTEXT_REQUEST_RATE:
-            args.long_context_request_rate = 2.0
+    args.loogle_dataset_path = find_data_file(args.data_dir, "loogle")
+    args.sharegpt_dataset_path = find_data_file(args.data_dir, "sharegpt")
+    args.reviewmt_dataset_path = find_data_file(args.data_dir, "reviewmt")
+    args.narrativeqa_dataset_path = find_data_file(args.data_dir, "narrativeqa")
+
+    fast_default_fraction = args.mode == "fast" and args.data_fraction is None
+    if args.data_fraction is None:
+        args.data_fraction = FAST_DATA_FRACTION if args.mode == "fast" else 1.0
+
+    args.serving_fraction = args.data_fraction
+    args.warm_fraction = args.data_fraction
+    args.long_context_fraction = (
+        FAST_LONG_CONTEXT_FRACTION if fast_default_fraction else args.data_fraction
+    )
+    args.dataset_multiround_fraction = (
+        FAST_DATASET_MULTITURN_FRACTION
+        if fast_default_fraction
+        else args.data_fraction
+    )
+    args.serving_min_prompts = FAST_MIN_SERVING_PROMPTS if fast_default_fraction else 1
+    args.warm_min_prompts = FAST_MIN_WARM_PROMPTS if fast_default_fraction else 1
+    args.long_context_min_clients = (
+        FAST_MIN_LONG_CONTEXT_CLIENTS if fast_default_fraction else 1
+    )
+    args.dataset_multiround_min_clients = (
+        FAST_MIN_DATASET_MULTITURN_CLIENTS if fast_default_fraction else 1
+    )
 
     sample_cap = args.sample_count if args.sample_count > 0 else None
-    if not (0 < args.data_fraction <= 1.0):
-        raise ValueError("--data-fraction must be in (0, 1]")
-    if args.data_fraction < 1.0 or sample_cap is not None:
+    fractions = [
+        args.serving_fraction,
+        args.warm_fraction,
+        args.long_context_fraction,
+        args.dataset_multiround_fraction,
+    ]
+    if any(not (0 < fraction <= 1.0) for fraction in fractions):
+        raise ValueError("all data fractions must be in (0, 1]")
+    if any(fraction < 1.0 for fraction in fractions) or sample_cap is not None:
         args.serving_num_prompts = scale_count(
-            args.serving_num_prompts, args.data_fraction, sample_cap
-        )
-        args.synthetic_clients = scale_count(
-            args.synthetic_clients, args.data_fraction, sample_cap
+            args.serving_num_prompts,
+            args.serving_fraction,
+            sample_cap,
+            args.serving_min_prompts,
         )
         args.warm_num_prompts = scale_count(
-            args.warm_num_prompts, args.data_fraction, sample_cap
+            args.warm_num_prompts,
+            args.warm_fraction,
+            sample_cap,
+            args.warm_min_prompts,
         )
         args.long_context_clients = scale_count(
-            args.long_context_clients, args.data_fraction, sample_cap
+            args.long_context_clients,
+            args.long_context_fraction,
+            sample_cap,
+            args.long_context_min_clients,
         )
-
-    if args.l3_replay and args.clear_l3_cache_before_run:
-        print("[l3] disabling --clear-l3-cache-before-run because --l3-replay needs persistent L3 state")
-        args.clear_l3_cache_before_run = False
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1698,13 +1606,31 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated workload types: strata-longdoc-loogle, "
             "strata-longdoc-narrativeqa, strata-multiround-sharegpt, "
             "strata-multiround-reviewmt, serving-shared-prefix, warm-cache, "
-            "long-context, serving, strata, fast, all, default"
+            "long-context, serving, strata, all, default"
+        ),
+    )
+    parser.add_argument(
+        "--request-rates",
+        default="",
+        help=(
+            "Unified Poisson-arrival request-rate list in requests/sec. "
+            "When set, it drives serving, shared-prefix, ShareGPT/ReviewMT "
+            "multi-round, and NarrativeQA/long-context workloads. Accepts "
+            "comma-separated values or start,stop,step."
         ),
     )
     parser.add_argument(
         "--output-dir",
         default=None,
         help="Directory for run logs, metrics snapshots, and JSONL outputs.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR,
+        help=(
+            "Dataset root scanned for the standard all-in-one layout. Defaults "
+            "to ./data in the current working directory."
+        ),
     )
     parser.add_argument(
         "--session-name",
@@ -1727,11 +1653,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-fraction",
         type=float,
-        default=1.0,
+        default=None,
         help=(
-            "Scale sample counts for all workload families. For dataset-backed "
-            "serving workloads, shuffling makes this a random-ish subset unless "
-            "--serving-disable-shuffle is used."
+            "Scale sample counts for all workload families. Defaults to 1.0. "
+            "Fast mode uses this as the LooGLE/warm-cache fraction, but uses "
+            "larger built-in fractions for smaller NarrativeQA and "
+            "ShareGPT/ReviewMT client populations. If you pass --data-fraction "
+            "explicitly, that value applies to every scaled workload family. "
+            "Generic synthetic-multiturn clients are not scaled; set "
+            "--synthetic-clients explicitly when you want that generated "
+            "workload smaller. "
+            "Dataset-backed workloads sample randomly unless deterministic/"
+            "no-shuffle flags are used."
         ),
     )
     parser.add_argument(
@@ -1739,8 +1672,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Cap serving prompts, synthetic clients, warm-cache prompts, and "
-            "long-context clients. 0 means no cap."
+            "Cap serving prompts, warm-cache prompts, and long-context clients. "
+            "Also caps ShareGPT/ReviewMT dataset-backed multi-round clients. "
+            "Does not cap generic synthetic-multiturn clients. 0 means no cap."
         ),
     )
     parser.add_argument(
@@ -1763,6 +1697,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not flush server KV cache before each workload run.",
     )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=float,
+        default=60.0,
+        help=(
+            "Seconds to let /flush_cache wait for the server to become idle. "
+            "Prevents transient 400 errors between back-to-back benchmark phases."
+        ),
+    )
     parser.add_argument("--post-flush-sleep", type=float, default=1.0)
     parser.add_argument(
         "--no-capture-metrics",
@@ -1772,11 +1715,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-timeout", type=float, default=10.0)
 
     l3 = parser.add_argument_group("L3 / storage HiCache options")
-    l3.add_argument(
-        "--l3-cache",
-        action="store_true",
-        help="Record/check L3 storage-cache setup and include storage metrics.",
-    )
     l3.add_argument(
         "--l3-runtime-attach",
         action="store_true",
@@ -1817,15 +1755,7 @@ def parse_args() -> argparse.Namespace:
     l3.add_argument(
         "--clear-l3-cache-before-run",
         action="store_true",
-        help="Clear the storage backend before each non-replay run.",
-    )
-    l3.add_argument(
-        "--l3-replay",
-        action="store_true",
-        help=(
-            "For replayable workloads, run a populate pass and then an immediate "
-            "replay pass after memory flushes so L3 load-back can be observed."
-        ),
+        help="Clear the storage backend before each run.",
     )
 
     fitness = parser.add_argument_group("fitness and feedback options")
@@ -1910,25 +1840,8 @@ def parse_args() -> argparse.Namespace:
     serving.add_argument("--serving-max-concurrency", type=int, default=None)
     serving.add_argument("--serving-fixed-output-len", type=int, default=None)
     serving.add_argument("--serving-max-prompt-len", type=int, default=None)
-    serving.add_argument(
-        "--no-auto-max-prompt-len",
-        action="store_true",
-        help="Do not infer --max-prompt-len from the target server_info.",
-    )
     serving.add_argument("--serving-disable-shuffle", action="store_true")
     serving.add_argument("--extra-serving-args", default="")
-    serving.add_argument("--serving-multiturn-dataset-name", default="loogle")
-    serving.add_argument(
-        "--serving-multiturn-dataset-path",
-        default="",
-        help="Defaults to LooGLE/data/longdep_qa.jsonl.",
-    )
-    serving.add_argument("--serving-shared-prefix-dataset-name", default="loogle")
-    serving.add_argument(
-        "--serving-shared-prefix-dataset-path",
-        default="",
-        help="Defaults to LooGLE/data/longdep_qa.jsonl.",
-    )
 
     synthetic = parser.add_argument_group("synthetic-multiturn options")
     synthetic.add_argument("--synthetic-request-rates", default=DEFAULT_SYNTHETIC_REQUEST_RATES)
@@ -1939,58 +1852,12 @@ def parse_args() -> argparse.Namespace:
     synthetic.add_argument("--synthetic-max-parallel", type=int, default=DEFAULT_SYNTHETIC_MAX_PARALLEL)
     synthetic.add_argument("--synthetic-round-barrier", action="store_true")
     synthetic.add_argument("--synthetic-disable-random-sample", action="store_true")
-    synthetic.add_argument("--synthetic-dataset-path", default="")
     synthetic.add_argument(
         "--synthetic-api-format",
         choices=["sglang", "openai"],
         default="sglang",
     )
     synthetic.add_argument("--extra-synthetic-args", default="")
-
-    strata = parser.add_argument_group("Strata dataset options")
-    strata.add_argument(
-        "--strata-sharegpt-dataset-path",
-        dest="strata_sharegpt_dataset_path",
-        default="",
-        help=(
-            "Optional ShareGPT JSON path for strata-multiround-sharegpt. "
-            "If omitted, SGLang's ShareGPT downloader/cache path is used."
-        ),
-    )
-    strata.add_argument(
-        "--strata-reviewmt-dataset-path",
-        dest="strata_reviewmt_dataset_path",
-        default="",
-        help=(
-            "ReviewMT converted to ShareGPT-style conversation JSON. "
-            "Required for strata-multiround-reviewmt."
-        ),
-    )
-    strata.add_argument(
-        "--strata-narrativeqa-dataset-path",
-        dest="strata_narrativeqa_dataset_path",
-        default="",
-        help=(
-            "NarrativeQA converted to bench_long_context.py JSON format "
-            "with top-level contexts and queries. Required for "
-            "strata-longdoc-narrativeqa."
-        ),
-    )
-    parser.add_argument(
-        "--paper-sharegpt-dataset-path",
-        dest="strata_sharegpt_dataset_path",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--paper-reviewmt-dataset-path",
-        dest="strata_reviewmt_dataset_path",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--paper-narrativeqa-dataset-path",
-        dest="strata_narrativeqa_dataset_path",
-        help=argparse.SUPPRESS,
-    )
 
     warm = parser.add_argument_group("warm-cache options")
     warm.add_argument("--warm-num-prompts", type=int, default=DEFAULT_WARM_NUM_PROMPTS)
@@ -2001,46 +1868,61 @@ def parse_args() -> argparse.Namespace:
     warm.add_argument("--extra-warm-args", default="")
 
     long_context = parser.add_argument_group("long-context options")
-    long_context.add_argument("--long-context-dataset-path", default="")
     long_context.add_argument("--long-context-clients", type=int, default=DEFAULT_LONG_CONTEXT_CLIENTS)
     long_context.add_argument("--long-context-request-rate", type=float, default=DEFAULT_LONG_CONTEXT_REQUEST_RATE)
+    long_context.add_argument("--long-context-max-prompt-len", type=int, default=None)
     long_context.add_argument("--extra-long-context-args", default="")
 
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    apply_presets(args)
-    session_id = args.session_name or datetime.now().strftime("%Y%m%d-%H%M%S")
-    suite_dir = Path(args.output_dir or f"bench_all_results/{session_id}").resolve()
-    suite_dir.mkdir(parents=True, exist_ok=True)
-
+def run_suite(args: argparse.Namespace, session_id: str, suite_dir: Path) -> int:
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("SGLANG_TORCH_PROFILER_DIR", str(suite_dir / "profiles"))
     print(f"Writing results under {suite_dir}")
     print(f"Session id: {session_id}")
     print(f"Target server: {base_url(args)}")
+    print(f"Data dir: {Path(args.data_dir).resolve()}")
+    print(f"Expanded workloads: {','.join(expand_workloads(args.workloads))}")
+    if args.request_rates:
+        print(f"Unified request rates: {args.request_rates}")
     if not args.no_capture_metrics:
         print("Metrics capture: enabled")
     if args.mode == "fast":
+        dataset_multiround_clients = dataset_multiround_client_count(args)
         print(
             "Fast mode: enabled "
-            f"(workloads={args.workloads}, serving_num_prompts={args.serving_num_prompts}, "
-            f"synthetic_clients={args.synthetic_clients}, warm_num_prompts={args.warm_num_prompts})"
+            f"(workloads={args.workloads}, data_fraction={args.data_fraction}, "
+            f"serving_fraction={args.serving_fraction}, "
+            f"long_context_fraction={args.long_context_fraction}, "
+            f"dataset_multiround_fraction={args.dataset_multiround_fraction}, "
+            f"serving_num_prompts={args.serving_num_prompts}, "
+            f"serving_max_concurrency={args.serving_max_concurrency}, "
+            f"serving_max_prompt_len={args.serving_max_prompt_len}, "
+            f"synthetic_clients={args.synthetic_clients}, "
+            f"dataset_multiround_clients={dataset_multiround_clients}, "
+            f"synthetic_rounds={args.synthetic_rounds}, "
+            f"synthetic_request_length={args.synthetic_request_length}, "
+            f"warm_num_prompts={args.warm_num_prompts}, "
+            f"warm_total_tokens={args.warm_total_tokens}, "
+            f"long_context_clients={args.long_context_clients}, "
+            f"long_context_max_prompt_len={args.long_context_max_prompt_len})"
         )
-    if args.l3_cache:
         print(
-            "L3 cache mode: enabled "
-            f"(backend={args.l3_storage_backend}, replay={args.l3_replay})"
+            "Fast mode is a scaled smoke run, not the full Strata-style run: "
+            f"NarrativeQA requests={args.long_context_clients}, "
+            f"ShareGPT/ReviewMT clients={dataset_multiround_clients}, "
+            f"ShareGPT/ReviewMT total turns={dataset_multiround_clients * args.synthetic_rounds}. "
+            "Use --data-fraction 1.0 or remove --fast for full local counts."
         )
+    print(f"L3 cache observation: enabled (backend={args.l3_storage_backend})")
     if args.profile:
         print(f"Profiling: enabled under {args.profile_output_dir or suite_dir / 'profiles'}")
     if not args.dry_run:
         preflight_server(args)
     prepare_l3_cache(args, suite_dir)
 
-    runs = maybe_add_l3_replay_runs(args, build_runs(args, suite_dir), suite_dir)
+    runs = build_runs(args, suite_dir)
     if not runs:
         print("No benchmark runs selected.")
         return 1
@@ -2073,14 +1955,39 @@ def main() -> int:
     (suite_dir / "fitness.txt").write_text(
         f"{summary['fitness_score']:.12g}\n", encoding="utf-8"
     )
-    write_feedback_report(summary, suite_dir / "feedback.md")
+    write_report(summary, suite_dir / "report.md")
 
     print(f"Completed {succeeded}/{attempted} attempted runs ({len(runs)} planned).")
     print(f"Run index: {suite_dir / 'runs.jsonl'}")
     print(f"Fitness summary: {suite_dir / 'fitness_summary.json'}")
-    print(f"Feedback report: {suite_dir / 'feedback.md'}")
+    print(f"Report: {suite_dir / 'report.md'}")
     print(f"Final fitness ({args.fitness_aggregate}): {summary['fitness_score']:.6g}")
     return 1 if failed else 0
+
+
+def main() -> int:
+    args = parse_args()
+    normalize_args(args)
+    session_id = args.session_name or datetime.now().strftime("%Y%m%d-%H%M%S")
+    suite_dir = Path(args.output_dir or f"bench_all_results/{session_id}").resolve()
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    for stale_name in ("runs.jsonl",):
+        stale_path = suite_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
+
+    terminal_log_path = suite_dir / "terminal.log"
+    args.terminal_log = str(terminal_log_path)
+    with terminal_log_path.open(
+        "w", encoding="utf-8", errors="replace", buffering=1
+    ) as terminal_log:
+        tee_stdout = TeeText(sys.stdout, terminal_log)
+        tee_stderr = TeeText(sys.stderr, terminal_log)
+        with contextlib.redirect_stdout(tee_stdout), contextlib.redirect_stderr(
+            tee_stderr
+        ):
+            print(f"Terminal log: {terminal_log_path}")
+            return run_suite(args, session_id, suite_dir)
 
 
 if __name__ == "__main__":
