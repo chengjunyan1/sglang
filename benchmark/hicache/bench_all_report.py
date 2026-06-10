@@ -1,6 +1,7 @@
 """Session summaries and Markdown reports for bench_all_in_one.py."""
 
 import argparse
+import json
 import math
 import shlex
 from datetime import datetime
@@ -70,6 +71,16 @@ def collect_top_metrics(records: List[dict]) -> Dict[str, float]:
     merged = {f"sum.{key}": value for key, value in totals.items()}
     merged.update({f"max.{key}": value for key, value in maxes.items()})
     return merged
+
+
+def read_l3_config(suite_dir: Path) -> dict:
+    path = suite_dir / "l3_config.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def cmd_option(cmd: List[str], option: str, default: str = "") -> str:
@@ -245,6 +256,7 @@ def build_session_summary(
         "data_fraction": args.data_fraction,
         "sample_count": args.sample_count,
         "l3_storage_backend": args.l3_storage_backend,
+        "l3_config": read_l3_config(suite_dir),
         "terminal_log": getattr(args, "terminal_log", ""),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "suite_dir": str(suite_dir),
@@ -297,6 +309,18 @@ def fmt_number(value: object, precision: int = 4) -> str:
     if abs(value) >= 10000 or (0 < abs(value) < 0.001):
         return f"{value:.{precision}g}"
     return f"{value:.{precision}f}".rstrip("0").rstrip(".")
+
+
+def fmt_bytes(value: object) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return ""
+    value = float(value)
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return ""
 
 
 def markdown_table(headers: List[str], rows: List[List[object]]) -> List[str]:
@@ -359,9 +383,52 @@ def write_report(summary: dict, path: Path) -> None:
         f"- output_dir: `{summary.get('suite_dir')}`",
         f"- terminal_log: `{summary.get('terminal_log') or ''}`",
         "",
-        "## Best Run",
+        "## L3 Storage",
         "",
     ]
+
+    l3_config = summary.get("l3_config") or {}
+    l3_status = (
+        l3_config.get("status_final")
+        or l3_config.get("status_after")
+        or l3_config.get("status_before")
+        or {}
+    )
+    l3_stats = (
+        l3_config.get("file_storage_stats_final")
+        or l3_config.get("file_storage_stats_after_clear")
+        or l3_config.get("file_storage_stats_before")
+        or {}
+    )
+    if l3_config:
+        lines.extend(
+            [
+                f"- backend: `{l3_status.get('hicache_storage_backend') or summary.get('l3_storage_backend')}`",
+                f"- prefetch_policy: `{l3_status.get('hicache_storage_prefetch_policy') or ''}`",
+                f"- write_policy: `{l3_status.get('hicache_write_policy') or ''}`",
+                f"- file_storage_dir: `{l3_config.get('file_storage_dir') or l3_stats.get('path') or ''}`",
+                f"- clear_before_suite: `{l3_config.get('clear_before_suite')}`",
+                f"- clear_before_run: `{l3_config.get('clear_before_run')}`",
+                f"- filesystem_used: `{fmt_bytes(l3_stats.get('fs_used_bytes'))}`",
+                f"- filesystem_available: `{fmt_bytes(l3_stats.get('fs_available_bytes'))}`",
+                f"- filesystem_used_pct: `{fmt_number((l3_stats.get('fs_used_pct') or 0) * 100)}%`",
+                "",
+            ]
+        )
+        notes = l3_config.get("notes") or []
+        if notes:
+            lines.extend(["Notes:"])
+            lines.extend([f"- {note}" for note in notes])
+            lines.append("")
+    else:
+        lines.extend(["No L3 config captured.", ""])
+
+    lines.extend(
+        [
+        "## Best Run",
+        "",
+        ]
+    )
     best = summary.get("best_run")
     if best:
         lines.extend(

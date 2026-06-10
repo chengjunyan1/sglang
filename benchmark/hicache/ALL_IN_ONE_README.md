@@ -190,11 +190,12 @@ few minutes.
 
 ```bash
 export SGLANG_ADMIN_API_KEY=1234567890
-export CANDIDATE_ID=smoke_001
+export CANDIDATE_ID=smoke_001f
 
 cd /scratch/ows/alphacache/extern/sglang/benchmark/hicache
 
 python3 bench_all_in_one.py \
+  --fast \
   --data-dir data \
   --model Qwen/Qwen3.5-9B \
   --host 127.0.0.1 \
@@ -206,9 +207,9 @@ python3 bench_all_in_one.py \
   --session-name "$CANDIDATE_ID" \
   --output-dir "bench_all_results/$CANDIDATE_ID" \
   --flush-cache-timeout 120 \
+  --clear-l3-cache \
   --fitness-file fitness_template.py \
-  --continue-on-error \
-  --fast
+  --continue-on-error
 ```
 
 For the full run, remove `--fast` and change `CANDIDATE_ID` to a new session
@@ -219,6 +220,12 @@ sample-count/client-count workloads for a middle-sized run. Dataset-backed
 workloads sample randomly by default; pass `--serving-disable-shuffle` or
 `--synthetic-disable-random-sample` only when you need deterministic first-N
 behavior.
+
+`--clear-l3-cache` clears the server's configured storage backend once before
+the suite starts. Keep it for fresh candidate comparisons. Omit it only when
+you intentionally want file/SSD cache contents to carry over from an earlier
+session. The file backend is persistent storage; do not assume it will clean up
+old `.bin` files automatically between benchmark sessions.
 
 If you are debugging on a smaller-context server, keep the result labeled as a
 smoke test and pass explicit caps such as `--long-context-max-prompt-len` or
@@ -250,6 +257,7 @@ python3 bench_all_in_one.py \
   --session-name "$CANDIDATE_ID" \
   --output-dir "bench_all_results/$CANDIDATE_ID" \
   --flush-cache-timeout 120 \
+  --clear-l3-cache \
   --fitness-file fitness_template.py \
   --continue-on-error
 ```

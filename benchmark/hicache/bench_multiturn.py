@@ -208,6 +208,24 @@ def flush_cache(url: str, timeout_s: float = 60.0) -> None:
         print(f"WARNING: flush_cache failed: {response.status_code} {response.text[:160]}")
 
 
+def ensure_sample_count(samples, count: int, label: str):
+    if count <= 0:
+        return []
+    if not samples:
+        raise ValueError(f"{label} sampling returned no requests")
+    if len(samples) >= count:
+        return samples[:count]
+    repeated = []
+    while len(repeated) < count:
+        needed = count - len(repeated)
+        repeated.extend(samples[:needed])
+    print(
+        f"WARNING: {label} sampling returned {len(samples)} requests; "
+        f"reusing samples to reach {count}."
+    )
+    return repeated
+
+
 class ReadyQueue:
     """
     Thread-safe queue that can pop requests in different orders based on given policy.
@@ -307,6 +325,9 @@ class WorkloadGenerator:
             random_sample=not args.disable_random_sample,
             return_text=False,
         )
+        first_round_samples = ensure_sample_count(
+            first_round_samples, args.num_clients, "first-round"
+        )
         # Store per-sample output_len for first round
         first_round_output_lens = [row.output_len for row in first_round_samples]
         # r.prompt is now List[int] when return_text=False
@@ -328,6 +349,9 @@ class WorkloadGenerator:
             dataset_path=args.dataset_path,
             random_sample=not args.disable_random_sample,
             return_text=False,
+        )
+        self.sub_question_inputs = ensure_sample_count(
+            self.sub_question_inputs, num_sub_questions, "sub-question"
         )
 
         if self.api_format == "openai":

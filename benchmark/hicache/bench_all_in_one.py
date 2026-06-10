@@ -798,6 +798,31 @@ def clear_l3_storage(args: argparse.Namespace, reason: str) -> bool:
     return ok
 
 
+def l3_file_storage_stats(path: str) -> dict:
+    if not path:
+        return {}
+    storage_path = Path(path).expanduser()
+    stat_target = storage_path if storage_path.exists() else storage_path.parent
+    try:
+        stat = os.statvfs(stat_target)
+    except OSError as exc:
+        return {"path": str(storage_path), "error": str(exc)}
+
+    total = stat.f_frsize * stat.f_blocks
+    available = stat.f_frsize * stat.f_bavail
+    free = stat.f_frsize * stat.f_bfree
+    used = total - free
+    return {
+        "path": str(storage_path),
+        "exists": storage_path.exists(),
+        "fs_total_bytes": total,
+        "fs_used_bytes": used,
+        "fs_free_bytes": free,
+        "fs_available_bytes": available,
+        "fs_used_pct": (used / total) if total else None,
+    }
+
+
 def prepare_l3_cache(args: argparse.Namespace, suite_dir: Path) -> dict:
     if args.l3_storage_backend == "file" and args.l3_storage_dir:
         Path(args.l3_storage_dir).mkdir(parents=True, exist_ok=True)
@@ -813,6 +838,10 @@ def prepare_l3_cache(args: argparse.Namespace, suite_dir: Path) -> dict:
         "status_after": None,
         "attach_ok": None,
         "clear_ok": None,
+        "file_storage_stats_before": l3_file_storage_stats(args.l3_storage_dir)
+        if args.l3_storage_backend == "file"
+        else {},
+        "file_storage_stats_final": {},
         "notes": [],
     }
 
@@ -853,9 +882,22 @@ def prepare_l3_cache(args: argparse.Namespace, suite_dir: Path) -> dict:
 
     if args.clear_l3_cache:
         config["clear_ok"] = clear_l3_storage(args, "suite")
+        config["file_storage_stats_after_clear"] = l3_file_storage_stats(
+            args.l3_storage_dir
+        )
 
     write_text(suite_dir / "l3_config.json", json.dumps(config, indent=2))
     return config
+
+
+def finalize_l3_cache(args: argparse.Namespace, suite_dir: Path, config: dict) -> None:
+    if not config:
+        return
+    if not args.dry_run:
+        config["status_final"] = get_l3_status(args)
+    if args.l3_storage_backend == "file":
+        config["file_storage_stats_final"] = l3_file_storage_stats(args.l3_storage_dir)
+    write_text(suite_dir / "l3_config.json", json.dumps(config, indent=2))
 
 
 def print_metric_summary(
@@ -1920,7 +1962,7 @@ def run_suite(args: argparse.Namespace, session_id: str, suite_dir: Path) -> int
         print(f"Profiling: enabled under {args.profile_output_dir or suite_dir / 'profiles'}")
     if not args.dry_run:
         preflight_server(args)
-    prepare_l3_cache(args, suite_dir)
+    l3_config = prepare_l3_cache(args, suite_dir)
 
     runs = build_runs(args, suite_dir)
     if not runs:
@@ -1948,6 +1990,7 @@ def run_suite(args: argparse.Namespace, session_id: str, suite_dir: Path) -> int
         else:
             succeeded += 1
 
+    finalize_l3_cache(args, suite_dir, l3_config)
     summary = build_session_summary(args, suite_dir, session_id, records)
     (suite_dir / "fitness_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
