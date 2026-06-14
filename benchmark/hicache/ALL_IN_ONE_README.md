@@ -91,14 +91,18 @@ backend, so the closest single-node local-file version is:
 
 ```bash
 export SGLANG_ADMIN_API_KEY=1234567890
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/scratch/ows/alphacache/.hicache-file
 mkdir -p "$SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
 
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
 python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-9B \
+  --model-path Qwen/Qwen2.5-14B-Instruct \
   --host 0.0.0.0 \
   --port 30000 \
-  --tp-size 8 \
+  --tp-size 4 \
+  --context-length 131072 \
+  --json-model-override-args '{"model_max_length":131072,"rope_scaling":{"type":"yarn","rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768,"rope_theta":1000000.0}}' \
   --page-size 64 \
   --chunked-prefill-size 6144 \
   --mem-fraction-static 0.85 \
@@ -115,15 +119,14 @@ python3 -m sglang.launch_server \
   --admin-api-key "$SGLANG_ADMIN_API_KEY"
 ```
 
-  <!-- --context-length 262144 \ -->
-
-
 Use this command when the goal is to reproduce the public HiCache blog's
 long-context stress shape on local SSD/file storage. Use `--tp-size 4` or
 `--tp-size 8` for larger models such as `meta-llama/Llama-3.1-70B-Instruct`.
-Use `--context-length 262144` only with a model that accepts that window, such
-as the Qwen 9B command above. Use `--context-length 131072` for 128K
-Strata-style runs, or `65536` for a faster blog-style 64K run. If
+Use `--context-length 262144` only with a model/config that accepts that
+window. Qwen2.5 Instruct configs publish a 32K `max_position_embeddings`; the
+runtime JSON override above provides the YaRN stanza plus a SGLang-visible
+128K context key. Use `--context-length 131072` for 128K Strata-style runs, or
+`65536` for a faster blog-style 64K run. If
 `wait_complete` makes TTFT too conservative for your workload, change it to
 `best_effort` or `timeout` and record that choice in the candidate report.
 
@@ -188,30 +191,6 @@ warm-cache: 64 * 0.05 => 4 prompts
 Those are not full Strata-sized counts; they are meant to catch broken runs in a
 few minutes.
 
-```bash
-export SGLANG_ADMIN_API_KEY=1234567890
-export CANDIDATE_ID=smoke_001f
-
-cd /scratch/ows/alphacache/extern/sglang/benchmark/hicache
-
-python3 bench_all_in_one.py \
-  --fast \
-  --data-dir data \
-  --model Qwen/Qwen3.5-9B \
-  --host 127.0.0.1 \
-  --workloads strata,cache-extra \
-  --request-rates "16" \
-  --port 30000 \
-  --admin-api-key "$SGLANG_ADMIN_API_KEY" \
-  --candidate-id "$CANDIDATE_ID" \
-  --session-name "$CANDIDATE_ID" \
-  --output-dir "bench_all_results/$CANDIDATE_ID" \
-  --flush-cache-timeout 120 \
-  --clear-l3-cache \
-  --fitness-file fitness_template.py \
-  --continue-on-error
-```
-
 For the full run, remove `--fast` and change `CANDIDATE_ID` to a new session
 name. If you explicitly set `--data-fraction 0.10` or `--data-fraction 0.25`,
 that value applies to serving, long-context, warm-cache, and ShareGPT/ReviewMT
@@ -232,13 +211,21 @@ smoke test and pass explicit caps such as `--long-context-max-prompt-len` or
 `--serving-max-prompt-len`. The harness does not automatically filter or
 truncate Strata workloads.
 
-For a full local Strata-style run at request rate 16, remove `--fast` and pin
-the count/load knobs explicitly:
+For a 32k-context server, keep the serving and warm-cache caps below the
+server's reported `max_req_input_len`. For example, a server with
+`max_req_input_len=32762` needs caps around 32000; otherwise the first LooGLE
+request can fail with `400 Bad Request`.
 
 ```bash
+export SGLANG_ADMIN_API_KEY=1234567890
+export CANDIDATE_ID=smoke_001f
+
+cd /scratch/ows/alphacache/extern/sglang/benchmark/hicache
+
 python3 bench_all_in_one.py \
+  --fast \
   --data-dir data \
-  --model Qwen/Qwen3.5-9B \
+  --model Qwen/Qwen2.5-14B-Instruct \
   --host 127.0.0.1 \
   --workloads strata,cache-extra \
   --request-rates "16" \
@@ -249,8 +236,10 @@ python3 bench_all_in_one.py \
   --synthetic-output-length 1 \
   --synthetic-max-parallel 4 \
   --long-context-clients 24 \
+  --long-context-max-prompt-len 32000 \
+  --serving-max-prompt-len 32000 \
   --warm-num-prompts 64 \
-  --warm-total-tokens 32768 \
+  --warm-total-tokens 32000 \
   --port 30000 \
   --admin-api-key "$SGLANG_ADMIN_API_KEY" \
   --candidate-id "$CANDIDATE_ID" \
