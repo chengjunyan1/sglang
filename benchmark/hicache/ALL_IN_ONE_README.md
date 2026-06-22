@@ -236,8 +236,8 @@ python3 bench_all_in_one.py \
   --synthetic-output-length 1 \
   --synthetic-max-parallel 4 \
   --long-context-clients 24 \
-  --long-context-max-prompt-len 32000 \
-  --serving-max-prompt-len 32000 \
+  --long-context-max-prompt-len 131072 \
+  --serving-max-prompt-len 131072 \
   --warm-num-prompts 64 \
   --warm-total-tokens 32000 \
   --port 30000 \
