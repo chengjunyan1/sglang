@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=691, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=470, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestStreamingSessionRetractMixedChunk(
@@ -74,7 +74,6 @@ class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKi
         *_EAGLE3_SPEC_ARGS,
     ]
     env_overrides = [
-        ("SGLANG_ENABLE_SPEC_V2", True),
         ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]
 

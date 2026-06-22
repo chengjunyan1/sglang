@@ -13,7 +13,7 @@ from sglang.srt.speculative.spec_registry import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _RegistryIsolated(CustomTestCase):
@@ -162,16 +162,22 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertEqual(self.algo.is_some(), not self.algo.is_none())
         self.assertEqual(SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some())
 
-    def test_supports_spec_v2_follows_supports_overlap(self):
-        # Plugin registered with supports_overlap=False -> not spec_v2.
-        self.assertFalse(self.algo.supports_spec_v2())
+    def test_supports_overlap_false_warns_deprecation(self):
+        # supports_overlap=False plugins run the V2 schema synchronously; the
+        # removed V1 path is surfaced as a deprecation warning at create time.
+        server_args = MagicMock()
+        server_args.disable_overlap_schedule = True
+        with self.assertLogs("sglang.srt.speculative.spec_registry", "WARNING") as logs:
+            self.algo.create_worker(server_args)
+        self.assertTrue(any("deprecated" in line for line in logs.output))
 
         @SpeculativeAlgorithm.register("MY_V2", supports_overlap=True)
         def _factory(server_args):
             return MagicMock
 
         v2 = SpeculativeAlgorithm.from_string("MY_V2")
-        self.assertTrue(v2.supports_spec_v2())
+        server_args.disable_overlap_schedule = False
+        self.assertIs(v2.create_worker(server_args), MagicMock)
 
     def test_create_worker_calls_factory(self):
         server_args = MagicMock()

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=22, stage="base-b", runner_config="1-gpu-small")
 
 
 CUSTOMIZED_INFO_FIELD = "sampled_token_ids_copy"
@@ -36,8 +36,8 @@ class CustomizedInfoSampler(Sampler):
 
     def forward(
         self,
-        logits_output: "LogitsProcessorOutput",
-        sampling_info: "SamplingBatchInfo",
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
         return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
@@ -93,7 +93,6 @@ class TestCustomizedInfoStreaming(CustomTestCase):
             incremental_streaming_output=True,
             skip_tokenizer_init=True,
             disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
             disable_radix_cache=True,
             random_seed=0,
             log_level="error",

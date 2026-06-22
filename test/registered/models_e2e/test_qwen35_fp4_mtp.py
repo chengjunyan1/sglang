@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
@@ -15,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=740, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=849, stage="base-c", runner_config="4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
@@ -92,7 +91,6 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.init_reasoning_token_verifier()
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -102,7 +100,6 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
@@ -117,7 +114,6 @@ class TestQwen35FP4MTPFlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.init_reasoning_token_verifier()
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -132,7 +128,6 @@ class TestQwen35FP4MTPFlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):

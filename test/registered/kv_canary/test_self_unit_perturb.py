@@ -27,7 +27,7 @@ from sglang.srt.kv_canary.perturb.utils import (
     flip_first_byte_in_source,
     pick_target_group,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_buffer_group,
@@ -40,7 +40,8 @@ from sglang.test.test_utils import CustomTestCase
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
-register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestParseTargetGroupKind(CustomTestCase):

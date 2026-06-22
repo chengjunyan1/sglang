@@ -38,7 +38,7 @@ from sglang.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 
-register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=139, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -188,7 +188,7 @@ def init_process_dst(
             model_path=model_name,
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
-            cuda_graph_max_bs=2,
+            cuda_graph_max_bs_decode=2,
             tokenizer_path=model_name,
             remote_instance_weight_loader_seed_instance_ip=seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=seed_instance_service_port,

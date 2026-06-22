@@ -6,7 +6,7 @@ from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
-register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=618, stage="base-c", runner_config="4-gpu-b200")
 
 DSV32_FP4_MODEL = "nvidia/DeepSeek-V3.2-NVFP4"
 
@@ -46,7 +46,15 @@ class TestDeepseekV32FP4TPSpec(GSM8KMixin, DefaultServerBase):
     gsm8k_accept_length_thres = 2.7
 
     def test_z_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        args = BenchArgs(
+            port=int(self.base_url.split(":")[-1]),
+            max_new_tokens=2048,
+            prompt=(
+                "Human: Think carefully before answering. Build a fully functional FastAPI todo server. "
+                "Start with a short design plan, then output the complete Python code, then show how to run it "
+                "and test three endpoints.\n\nAssistant:"
+            ),
+        )
         acc_length, speed = send_one_prompt(args)
 
         print(f"{acc_length=:.2f} {speed=:.2f}")

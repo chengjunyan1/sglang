@@ -12,7 +12,7 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.runner import kernel_launcher as kernel_launcher_module
 from sglang.srt.kv_canary.state import ViolationLog
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
 from sglang.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
@@ -20,7 +20,8 @@ from sglang.test.kv_canary.runner_test_base import (
     make_manager,
 )
 
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestManagerPerForward(CanaryManagerTestCase):

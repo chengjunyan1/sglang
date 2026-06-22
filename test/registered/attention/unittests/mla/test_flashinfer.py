@@ -17,11 +17,6 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_mla_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_mla_draft_extend_cuda_graph_case,
-    run_mla_eagle_draft_extend_case,
-    run_mla_eagle_draft_extend_cuda_graph_runner_case,
-)
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_mla_eagle_draft_cuda_graph_runner_case,
 )
@@ -42,8 +37,8 @@ MLA_SHAPE_KWARGS = dict(
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -99,39 +94,6 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
-        ),
-    )
-    DRAFT_EXTEND_CASES = (
-        MLAAttentionCase(
-            name="runner_eagle_draft_extend_mla_ragged_accept",
-            backend="flashinfer",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            page_size=16,
-            prefix_lens=(5, 8),
-            extend_lens=(2, 4),
-        ),
-    )
-    DRAFT_EXTEND_CUDA_GRAPH_CASES = (
-        MLAAttentionCase(
-            name="runner_cuda_graph_eagle_draft_extend_mla_ragged_accept",
-            backend="flashinfer",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            page_size=16,
-            prefix_lens=(5, 8),
-            extend_lens=(2, 4),
-        ),
-    )
-    EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
-        MLAAttentionCase(
-            name="runner_eagle_draft_extend_mla_cuda_graph_runner_ragged_accept",
-            backend="flashinfer",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            page_size=16,
-            prefix_lens=(5, 8),
-            extend_lens=(2, 4),
         ),
     )
     EAGLE_DRAFT_RUNNER_CASES = (
@@ -256,29 +218,6 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
                     self,
                     case,
                     topk=topk,
-                    **MLA_SHAPE_KWARGS,
-                )
-
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_mla_eagle_draft_extend_case(self, case, **MLA_SHAPE_KWARGS)
-
-    def test_runner_mode_eagle_draft_extend_cuda_graph_cases(self):
-        for case in self.DRAFT_EXTEND_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_mla_draft_extend_cuda_graph_case(
-                    self,
-                    case,
-                    **MLA_SHAPE_KWARGS,
-                )
-
-    def test_runner_mode_eagle_draft_extend_cuda_graph_runner_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_RUNNER_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_mla_eagle_draft_extend_cuda_graph_runner_case(
-                    self,
-                    case,
                     **MLA_SHAPE_KWARGS,
                 )
 

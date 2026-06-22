@@ -17,7 +17,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 PAGE_SIZE = 2
 
@@ -37,6 +37,7 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             model_path="dummy",
             page_size=PAGE_SIZE,
             hicache_io_backend="direct",
+            hicache_mem_layout="layer_first",
             hicache_write_policy="write_through",
         )
         set_global_server_args_for_scheduler(server_args)
